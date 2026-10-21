@@ -68,7 +68,8 @@ impl LocalStore {
                    body BLOB NOT NULL,
                    etag INTEGER NOT NULL,
                    modified_ms INTEGER NOT NULL,
-                   attributes TEXT NOT NULL
+                   attributes TEXT NOT NULL,
+                   body_len INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS store_sequence (
                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -77,6 +78,7 @@ impl LocalStore {
                  INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
             )
             .map_err(db_error)?;
+        migrate_objects_schema(&connection)?;
         Ok(store)
     }
 
@@ -89,14 +91,14 @@ impl LocalStore {
     fn read(&self, key: &str) -> object_store::Result<StoredObject> {
         self.connect()?
             .query_row(
-                "SELECT key, body, etag, modified_ms, attributes, length(body)
+                "SELECT key, body, etag, modified_ms, attributes, body_len
                  FROM objects WHERE key = ?1",
                 [key],
                 |row| {
                     Ok(StoredObject {
                         key: row.get(0)?,
                         body: row.get(1)?,
-                        size: row.get(5)?,
+                        size: row.get::<_, i64>(5)? as u64,
                         etag: row.get(2)?,
                         modified_ms: row.get(3)?,
                         attributes: row.get(4)?,
@@ -108,27 +110,131 @@ impl LocalStore {
             .ok_or_else(|| not_found(key))
     }
 
-    fn metadata(&self) -> object_store::Result<Vec<StoredObject>> {
+    /// Metadata-only list. Optional `prefix` uses a key-range predicate so SQLite
+    /// can range-scan the covering `objects_list` index instead of walking every
+    /// row and computing `length(body)`.
+    fn metadata(&self, prefix: Option<&str>) -> object_store::Result<Vec<StoredObject>> {
         let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-                 FROM objects ORDER BY key",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(StoredObject {
-                    key: row.get(0)?,
-                    body: row.get(1)?,
-                    size: row.get(5)?,
-                    etag: row.get(2)?,
-                    modified_ms: row.get(3)?,
-                    attributes: row.get(4)?,
-                })
+        let prefix = prefix.unwrap_or("");
+        let (sql, bind): (&str, Vec<String>) = match key_prefix_upper(prefix) {
+            Some(upper) => (
+                "SELECT key, etag, modified_ms, attributes, body_len
+                 FROM objects
+                 WHERE key >= ?1 AND key < ?2
+                 ORDER BY key",
+                vec![prefix.to_string(), upper],
+            ),
+            None if prefix.is_empty() => (
+                "SELECT key, etag, modified_ms, attributes, body_len
+                 FROM objects
+                 ORDER BY key",
+                Vec::new(),
+            ),
+            None => (
+                "SELECT key, etag, modified_ms, attributes, body_len
+                 FROM objects
+                 WHERE key >= ?1
+                 ORDER BY key",
+                vec![prefix.to_string()],
+            ),
+        };
+        let mut statement = connection.prepare(sql).map_err(db_error)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<StoredObject> {
+            Ok(StoredObject {
+                key: row.get(0)?,
+                body: Vec::new(),
+                size: row.get::<_, i64>(4)? as u64,
+                etag: row.get(1)?,
+                modified_ms: row.get(2)?,
+                attributes: row.get(3)?,
             })
-            .map_err(db_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        };
+        if bind.is_empty() {
+            statement
+                .query_map([], map_row)
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)
+        } else if bind.len() == 1 {
+            statement
+                .query_map(params![bind[0]], map_row)
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)
+        } else {
+            statement
+                .query_map(params![bind[0], bind[1]], map_row)
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)
+        }
+    }
+
+    #[cfg(test)]
+    fn list_plan(&self, prefix: &str) -> object_store::Result<String> {
+        let connection = self.connect()?;
+        let format_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<String> {
+            Ok(format!(
+                "{}|{}|{}|{}",
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
+            ))
+        };
+        let lines = match key_prefix_upper(prefix) {
+            Some(upper) => {
+                let mut statement = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT key, etag, modified_ms, attributes, body_len
+                         FROM objects
+                         WHERE key >= ?1 AND key < ?2
+                         ORDER BY key",
+                    )
+                    .map_err(db_error)?;
+                let lines = statement
+                    .query_map(params![prefix, upper], format_row)
+                    .map_err(db_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_error)?;
+                lines
+            }
+            None if prefix.is_empty() => {
+                let mut statement = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT key, etag, modified_ms, attributes, body_len
+                         FROM objects
+                         ORDER BY key",
+                    )
+                    .map_err(db_error)?;
+                let lines = statement
+                    .query_map([], format_row)
+                    .map_err(db_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_error)?;
+                lines
+            }
+            None => {
+                let mut statement = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN
+                         SELECT key, etag, modified_ms, attributes, body_len
+                         FROM objects
+                         WHERE key >= ?1
+                         ORDER BY key",
+                    )
+                    .map_err(db_error)?;
+                let lines = statement
+                    .query_map(params![prefix], format_row)
+                    .map_err(db_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_error)?;
+                lines
+            }
+        };
+        Ok(lines.join("\n"))
     }
 
     fn put_sync(
@@ -168,16 +274,18 @@ impl LocalStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(db_error)?;
+        let body_len = body.len() as i64;
         transaction
             .execute(
-                "INSERT INTO objects(key, body, etag, modified_ms, attributes)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO objects(key, body, etag, modified_ms, attributes, body_len)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(key) DO UPDATE SET
                    body = excluded.body,
                    etag = excluded.etag,
                    modified_ms = excluded.modified_ms,
-                   attributes = excluded.attributes",
-                params![key, body.as_ref(), etag, modified_ms, attributes],
+                   attributes = excluded.attributes,
+                   body_len = excluded.body_len",
+                params![key, body.as_ref(), etag, modified_ms, attributes, body_len],
             )
             .map_err(db_error)?;
         transaction.commit().map_err(db_error)?;
@@ -217,6 +325,57 @@ fn configure_connection(connection: &Connection) -> object_store::Result<()> {
     connection
         .busy_timeout(Duration::from_secs(30))
         .map_err(db_error)
+}
+
+fn migrate_objects_schema(connection: &Connection) -> object_store::Result<()> {
+    let has_body_len: bool = connection
+        .prepare("PRAGMA table_info(objects)")
+        .map_err(db_error)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?
+        .iter()
+        .any(|name| name == "body_len");
+    if !has_body_len {
+        connection
+            .execute_batch(
+                "ALTER TABLE objects ADD COLUMN body_len INTEGER NOT NULL DEFAULT 0;
+                 UPDATE objects SET body_len = length(body);",
+            )
+            .map_err(db_error)?;
+    } else {
+        connection
+            .execute(
+                "UPDATE objects SET body_len = length(body) WHERE body_len = 0 AND length(body) > 0",
+                [],
+            )
+            .map_err(db_error)?;
+    }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS objects_list
+             ON objects(key, etag, modified_ms, attributes, body_len);",
+        )
+        .map_err(db_error)?;
+    Ok(())
+}
+
+/// Exclusive upper bound for a lexicographic key-prefix scan, or `None` when
+/// the prefix has no successor (every byte is 0xff) or is empty.
+fn key_prefix_upper(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last != 0xff {
+            *last += 1;
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.pop();
+    }
+    None
 }
 
 impl fmt::Display for LocalStore {
@@ -296,21 +455,24 @@ impl ObjectStore for LocalStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let prefix = prefix.cloned();
-        let result = self.metadata().and_then(|objects| {
-            objects
-                .into_iter()
-                .map(|object| object_meta(&object))
-                .filter(|meta| {
-                    meta.as_ref().map_or(true, |meta| {
-                        prefix.as_ref().is_none_or(|prefix| {
-                            meta.location
-                                .prefix_match(prefix)
-                                .is_some_and(|mut remainder| remainder.next().is_some())
+        let key_prefix = prefix.as_ref().map(|path| path.to_string());
+        let result = self
+            .metadata(key_prefix.as_deref())
+            .and_then(|objects| {
+                objects
+                    .into_iter()
+                    .map(|object| object_meta(&object))
+                    .filter(|meta| {
+                        meta.as_ref().map_or(true, |meta| {
+                            prefix.as_ref().is_none_or(|prefix| {
+                                meta.location
+                                    .prefix_match(prefix)
+                                    .is_some_and(|mut remainder| remainder.next().is_some())
+                            })
                         })
                     })
-                })
-                .collect::<object_store::Result<Vec<_>>>()
-        });
+                    .collect::<object_store::Result<Vec<_>>>()
+            });
         match result {
             Ok(objects) => stream::iter(objects.into_iter().map(Ok)).boxed(),
             Err(error) => stream::once(async move { Err(error) }).boxed(),
@@ -319,9 +481,10 @@ impl ObjectStore for LocalStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let prefix = prefix.cloned().unwrap_or_default();
+        let key_prefix = prefix.to_string();
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(Some(&key_prefix))? {
             let location = stored_location(&object.key)?;
             let Some(mut remainder) = location.prefix_match(&prefix) else {
                 continue;
@@ -372,7 +535,7 @@ impl PaginatedListStore for LocalStore {
         let delimiter = options.delimiter.as_deref();
         let limit = options.max_keys.unwrap_or(usize::MAX);
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(Some(prefix))? {
             let Some(remainder) = object.key.strip_prefix(prefix) else {
                 continue;
             };
@@ -519,6 +682,57 @@ fn decode_attributes(encoded: &str) -> object_store::Result<Attributes> {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_LOCAL_STORE_TESTS"));
+}
+
+#[cfg(test)]
+mod list_index_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn list_uses_covering_index_range_scan() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::open(dir.path().join("objects.sqlite3")).unwrap();
+        for i in 0..200 {
+            store
+                .put_sync(
+                    format!("cells/user/{i:04}.ltx"),
+                    Bytes::from(vec![b'x'; 64]),
+                    PutOptions::default(),
+                )
+                .unwrap();
+            store
+                .put_sync(
+                    format!("other/{i:04}"),
+                    Bytes::from(vec![b'y'; 8]),
+                    PutOptions::default(),
+                )
+                .unwrap();
+        }
+        let listed = store.metadata(Some("cells/")).unwrap();
+        assert_eq!(listed.len(), 200);
+        assert!(listed.iter().all(|object| object.key.starts_with("cells/")));
+
+        let plan = store.list_plan("cells/").unwrap().to_ascii_lowercase();
+        assert!(
+            plan.contains("objects_list"),
+            "expected objects_list index in plan, got:\n{plan}"
+        );
+        assert!(
+            plan.contains("covering") || plan.contains("using index"),
+            "expected covering/index range scan, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("scan table objects"),
+            "must not full-scan objects table, got:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn key_prefix_upper_increments_last_byte() {
+        assert_eq!(key_prefix_upper("cells/").as_deref(), Some("cells0"));
+        assert_eq!(key_prefix_upper("").as_deref(), None);
+    }
 }
 
 /// The [`Path`] a stored key came from. Every key is stored as
