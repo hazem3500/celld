@@ -6204,7 +6204,8 @@ impl NodeLogManager {
 
     /// The maintenance pass of epoch GC (denoland/celld#240): for each root
     /// cell this node holds, delete the epochs below its restore chain's
-    /// base. Off unless `CELLD_LTX_RETENTION_SECS` is positive. A facet stream is
+    /// base, then the L0 objects of its live epoch that an L1 object covers.
+    /// Off unless `CELLD_LTX_RETENTION_SECS` is positive. A facet stream is
     /// skipped: it has no ownership record, its epochs are a sparse subset of
     /// its root's, and its own chain base is usually far below the root's.
     /// A per-cell failure does not stop the pass.
@@ -6237,7 +6238,7 @@ impl NodeLogManager {
                 .collect()
         };
         for (cell, epoch) in due {
-            let next = match self
+            let epoch_next = match self
                 .ltx
                 .gc_superseded_epochs(&cell, epoch, grace_ms, || self.owns_epoch(&cell, epoch))
                 .await
@@ -6273,6 +6274,47 @@ impl NodeLogManager {
                     );
                     mono_ms().saturating_add(EPOCH_GC_RETRY_MS)
                 }
+            };
+            // The live epoch's covered L0 objects, under the same switch and
+            // grace. A pass that left work behind comes back at the short
+            // retry instead of the settled one.
+            let l0_more = match self
+                .ltx
+                .gc_covered_l0(&cell, epoch, grace_ms, || self.owns_epoch(&cell, epoch))
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    if !outcome.deleted.is_empty() {
+                        info!(
+                            event = "ltx_l0_gc",
+                            cell = %cell,
+                            epoch,
+                            scanned = outcome.scanned,
+                            deleted = outcome.deleted.len(),
+                            min_txid = outcome.deleted.first().map_or(0, |f| f.min_txid.0),
+                            max_txid = outcome.deleted.last().map_or(0, |f| f.max_txid.0),
+                            more = outcome.more,
+                            "deleted L0 objects an L1 object covers"
+                        );
+                    }
+                    outcome.more
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(
+                        event = "ltx_l0_gc",
+                        cell = %cell,
+                        epoch,
+                        %error,
+                        "L0 retention pass failed"
+                    );
+                    false
+                }
+            };
+            let next = if l0_more {
+                epoch_next.min(mono_ms().saturating_add(EPOCH_GC_RETRY_MS))
+            } else {
+                epoch_next
             };
             self.epoch_gc_due
                 .lock()

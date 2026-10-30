@@ -377,7 +377,7 @@ TUNING:
   CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
   CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
   CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
-  CELLD_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
+  CELLD_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs and L1-covered L0 objects (default: unset, no deletion)
   RUST_LOG                        Runtime log filter (default: info)
 
 Documentation: https://celld.dev/docs"#,

@@ -20,6 +20,7 @@ pub mod compactor;
 pub mod db;
 pub mod error;
 pub mod host;
+pub mod l0_retention;
 pub mod ltx;
 mod lz4_block;
 pub mod paged;
