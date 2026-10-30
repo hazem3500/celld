@@ -1149,6 +1149,14 @@ pub(crate) async fn read_retired_mark(
 /// oldest few and the next pass continues.
 const EPOCH_GC_EPOCHS_PER_PASS: usize = 64;
 
+/// The oldest L0 objects one L0 retention pass lists for one cell. A pass
+/// starts at the oldest, so a backlog drains over passes without one
+/// listing walking a prefix of hundreds of thousands of objects.
+const L0_GC_SCAN_PER_PASS: usize = 4096;
+
+/// The most L0 objects one retention pass deletes for one cell.
+const L0_GC_DELETES_PER_PASS: usize = 4096;
+
 /// A read-only view of one stream's epochs for epoch GC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochScan {
@@ -2058,6 +2066,66 @@ impl LtxRepl {
             deleted: plan.delete,
             settled,
         }))
+    }
+
+    /// Delete the L0 objects of the owner's own epoch that one of its L1
+    /// objects already covers and that are older than `grace_ms`
+    /// (see [`celld_ltx::l0_retention`]). Additive compaction never deletes
+    /// a source and epoch GC never touches the live epoch, so without this
+    /// a long-lived activation keeps one L0 object per transaction forever.
+    ///
+    /// It lists the bucket's per-cell objects only, never the bundle
+    /// overlay, so a row that lives only in a node bundle is never a
+    /// candidate. It skips a cell whose activation still reads pages from
+    /// its chain, as epoch GC does, and it reads the ownership record after
+    /// planning and before deleting. A covered L0 object is redundant for a
+    /// restore to the latest position whoever owns the cell, so the read is
+    /// a margin, not the safety argument. `None` when the pass decided
+    /// nothing.
+    pub async fn gc_covered_l0<F, Fut>(
+        &self,
+        cell: &str,
+        epoch: u64,
+        grace_ms: u64,
+        confirm_owner: F,
+    ) -> anyhow::Result<Option<celld_ltx::l0_retention::L0RetentionOutcome>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<bool>>,
+    {
+        let pinned_reads = match self.cells.lock().unwrap().get(&(cell.to_string(), epoch)) {
+            None => return Ok(None),
+            Some(handle) => {
+                handle.paged_vfs.is_some()
+                    && handle
+                        .hydration
+                        .as_ref()
+                        .is_none_or(|fill| !fill.complete.load(Ordering::SeqCst))
+            }
+        };
+        if pinned_reads {
+            return Ok(None);
+        }
+        let client = self.client_for(cell, epoch);
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(asyncrt::wall_ms().max(0) as u64);
+        let outcome = celld_ltx::l0_retention::plan_l0_retention(
+            &client,
+            now,
+            Duration::from_millis(grace_ms),
+            L0_GC_SCAN_PER_PASS,
+            L0_GC_DELETES_PER_PASS,
+        )
+        .await?;
+        if outcome.deleted.is_empty() {
+            return Ok(Some(outcome));
+        }
+        if !confirm_owner().await? {
+            return Ok(None);
+        }
+        celld_ltx::l0_retention::apply_l0_retention(&client, &outcome)
+            .await
+            .map_err(|error| anyhow!("delete covered L0 of {cell} e{epoch}: {error}"))?;
+        Ok(Some(outcome))
     }
 
     /// Folds a cloned activation's durable rows into its first L1 object, the

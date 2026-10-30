@@ -218,6 +218,16 @@ The order matters: otherwise a fenced owner could delete its successor's base.
 A late delete is safe because an epoch below the base never rejoins a chain.
 This relies on list-after-write consistency.
 
+The same pass also trims the owner's live epoch. Compaction to L1 is additive
+and never deletes its L0 sources, so without this an epoch keeps one L0 object
+per transaction for as long as it lives. The owner deletes an L0 object only
+when one L1 object's TXID range contains it and the L0 object is older than the
+configured time. A restore to the latest position never needs such an object,
+because its L1 object is always the better choice. Point-in-time restore to a
+TXID inside an L1 range is possible only within the grace. The pass skips a
+paged cell that is still filling, lists the bucket's per-cell objects (never a
+node bundle), and handles at most 4096 objects per cell per pass.
+
 A fenced node can append an unacknowledged tail to an older prefix. After a
 snapshot successor, a later restore can expose that tail; this does not violate
 the contract, because a missing acknowledgement does not prove a write absent.
